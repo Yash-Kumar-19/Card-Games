@@ -31,9 +31,10 @@ type Client struct {
 
 // Hub manages all connected WebSocket clients.
 type Hub struct {
-	clients   map[string]*Client // playerID -> Client
-	mu        sync.RWMutex
-	OnMessage func(clientID string, msg ClientMessage)
+	clients     map[string]*Client // playerID -> Client
+	mu          sync.RWMutex
+	OnMessage   func(clientID string, msg ClientMessage)
+	OnReconnect func(clientID string) // called when a known player reconnects
 }
 
 // NewHub creates a new WebSocket hub.
@@ -133,12 +134,22 @@ func (h *Hub) GetClientTable(clientID string) string {
 }
 
 // HandleWebSocket upgrades an HTTP connection to WebSocket.
+// If the player already has a connection (reconnect), the old one is replaced.
 func (h *Hub) HandleWebSocket(playerID, playerName string, w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("upgrade error: %v", err)
 		return
 	}
+
+	// Check for existing connection (reconnect scenario)
+	h.mu.Lock()
+	if old, exists := h.clients[playerID]; exists {
+		close(old.send)
+		old.conn.Close()
+		delete(h.clients, playerID)
+	}
+	h.mu.Unlock()
 
 	client := &Client{
 		ID:   playerID,
@@ -152,6 +163,11 @@ func (h *Hub) HandleWebSocket(playerID, playerName string, w http.ResponseWriter
 
 	go client.writePump()
 	go client.readPump()
+
+	// Notify server of reconnection so it can restore game state
+	if h.OnReconnect != nil {
+		h.OnReconnect(playerID)
+	}
 }
 
 const (

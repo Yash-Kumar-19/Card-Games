@@ -1,18 +1,21 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
-	"time"
 
+	"github.com/nakad/cardgames/config"
 	"github.com/nakad/cardgames/internal/auth"
 	"github.com/nakad/cardgames/internal/engine"
 	"github.com/nakad/cardgames/internal/game"
 	"github.com/nakad/cardgames/internal/games/teenpatti"
 	"github.com/nakad/cardgames/internal/lobby"
+	"github.com/nakad/cardgames/internal/store"
+	"github.com/nakad/cardgames/internal/wallet"
 	"github.com/nakad/cardgames/internal/ws"
 )
 
@@ -23,18 +26,27 @@ type Server struct {
 	auth      *auth.Store
 	jwt       *auth.JWTService
 	playerMap *lobby.PlayerTableMap
+	wallet    *wallet.Service
+	store     *store.MemStore
 }
 
 func main() {
+	// --- Config ---
+	cfg := config.Load()
+
 	// --- Setup ---
 	registry := game.NewRegistry()
 	_ = registry.Register(teenpatti.New())
 
-	jwtService := auth.NewJWTService("teen-patti-secret-change-me", 24*time.Hour)
+	jwtService := auth.NewJWTService(cfg.JWTSecret, cfg.JWTExpiry)
 	userStore := auth.NewStore()
 	hub := ws.NewHub()
-	lob := lobby.NewLobby(registry, 20*time.Second)
+	lob := lobby.NewLobby(registry, cfg.TurnTimeout)
 	playerMap := lobby.NewPlayerTableMap()
+
+	// In-memory store for development (swap with PgStore when DB is available)
+	memStore := store.NewMemStore()
+	walletService := wallet.NewService(memStore, memStore)
 
 	srv := &Server{
 		hub:       hub,
@@ -43,10 +55,15 @@ func main() {
 		auth:      userStore,
 		jwt:       jwtService,
 		playerMap: playerMap,
+		wallet:    walletService,
+		store:     memStore,
 	}
 
 	// Wire WebSocket message handler
 	hub.OnMessage = srv.handleClientMessage
+
+	// Wire reconnection handler
+	hub.OnReconnect = srv.handleReconnect
 
 	// --- HTTP Routes ---
 	mux := http.NewServeMux()
@@ -59,10 +76,14 @@ func main() {
 	mux.HandleFunc("GET /api/tables", srv.requireAuth(srv.handleListTables))
 	mux.HandleFunc("POST /api/tables", srv.requireAuth(srv.handleCreateTable))
 
+	// Wallet endpoints (authenticated)
+	mux.HandleFunc("GET /api/wallet/balance", srv.requireAuth(srv.handleGetBalance))
+	mux.HandleFunc("GET /api/wallet/transactions", srv.requireAuth(srv.handleGetTransactions))
+
 	// WebSocket endpoint (authenticated via query param token)
 	mux.HandleFunc("GET /ws", srv.handleWS)
 
-	addr := ":8080"
+	addr := ":" + cfg.Port
 	log.Printf("Server starting on %s", addr)
 	log.Printf("Registered games: %v", registry.List())
 	log.Fatal(http.ListenAndServe(addr, mux))
@@ -86,12 +107,14 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusConflict)
 		return
 	}
+	// Also create in store for wallet tracking
+	_, _ = s.store.CreateUserWithID(r.Context(), user.ID, user.Username, user.Password, user.Balance)
 	token, err := s.jwt.GenerateToken(user)
 	if err != nil {
 		jsonError(w, "token generation failed", http.StatusInternalServerError)
 		return
 	}
-	jsonResp(w, map[string]string{"token": token, "user_id": user.ID}, http.StatusCreated)
+	jsonResp(w, map[string]any{"token": token, "user_id": user.ID, "balance": user.Balance}, http.StatusCreated)
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -142,6 +165,16 @@ func (s *Server) handleCreateTable(w http.ResponseWriter, r *http.Request) {
 
 	// Wire broadcast callback
 	actor.OnBroadcast = s.broadcastToTable
+
+	// Wire wallet hooks
+	actor.Wallet = &engine.WalletHook{
+		CollectBoot: func(ctx context.Context, userID string, amount int64, tableID string) error {
+			return s.wallet.CollectBoot(ctx, userID, amount, tableID)
+		},
+		CreditWinnings: func(ctx context.Context, userID string, amount int64, tableID string) error {
+			return s.wallet.CreditWinnings(ctx, userID, amount, tableID)
+		},
+	}
 
 	jsonResp(w, map[string]string{"table_id": actor.Table.ID}, http.StatusCreated)
 }
@@ -334,6 +367,70 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// --- Reconnection handler ---
+
+func (s *Server) handleReconnect(clientID string) {
+	tableID := s.playerMap.Get(clientID)
+	if tableID == "" {
+		return
+	}
+	actor := s.lobby.GetTable(tableID)
+	if actor == nil {
+		s.playerMap.Delete(clientID)
+		return
+	}
+	// Restore client's table association
+	s.hub.SetClientTable(clientID, tableID)
+	// Send current game state
+	reply := actor.Send(engine.TableEvent{Type: "reconnect", PlayerID: clientID})
+	if reply.Err == nil && len(reply.Broadcast) > 0 {
+		s.broadcastToTable(tableID, reply.Broadcast)
+	}
+}
+
+// --- Wallet HTTP handler ---
+
+func (s *Server) handleGetBalance(w http.ResponseWriter, r *http.Request) {
+	claims := s.claimsFromRequest(r)
+	if claims == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	balance, err := s.wallet.GetBalance(r.Context(), claims.UserID)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonResp(w, map[string]any{"user_id": claims.UserID, "balance": balance}, http.StatusOK)
+}
+
+func (s *Server) handleGetTransactions(w http.ResponseWriter, r *http.Request) {
+	claims := s.claimsFromRequest(r)
+	if claims == nil {
+		jsonError(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	txs, err := s.wallet.GetHistory(r.Context(), claims.UserID, 50)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonResp(w, txs, http.StatusOK)
+}
+
+func (s *Server) claimsFromRequest(r *http.Request) *auth.Claims {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		return nil
+	}
+	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+	claims, err := s.jwt.ValidateToken(tokenStr)
+	if err != nil {
+		return nil
+	}
+	return claims
 }
 
 // --- JSON helpers ---

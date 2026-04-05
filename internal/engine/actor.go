@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
@@ -29,6 +30,15 @@ type BroadcastMsg struct {
 	Payload  any
 }
 
+// WalletHook is called by the actor for balance operations.
+// If nil, the actor falls back to in-memory balance on Player.
+type WalletHook struct {
+	CollectBoot    func(ctx context.Context, userID string, amount int64, tableID string) error
+	PlaceBet       func(ctx context.Context, userID string, amount int64, tableID string) error
+	CreditWinnings func(ctx context.Context, userID string, amount int64, tableID string) error
+	GetBalance     func(ctx context.Context, userID string) (int64, error)
+}
+
 // TableActor manages a table's lifecycle in a single goroutine.
 type TableActor struct {
 	Table       *Table
@@ -37,6 +47,8 @@ type TableActor struct {
 	turnTimer   *time.Timer
 	TurnTimeout time.Duration
 	OnBroadcast func(tableID string, msgs []BroadcastMsg)
+	Wallet      *WalletHook
+	RoundID     string // set when a round starts
 }
 
 // NewTableActor creates and starts a new table actor.
@@ -85,7 +97,23 @@ func (a *TableActor) handleEvent(evt TableEvent) {
 			reply.Broadcast = a.buildTableStateBroadcast("PLAYER_LEFT")
 		}
 
+	case "reconnect":
+		// Build a private state snapshot for the reconnecting player
+		reply.Broadcast = a.buildReconnectBroadcast(evt.PlayerID)
+
 	case "start":
+		// If wallet is configured, collect boots via wallet service first
+		if a.Wallet != nil && a.Wallet.CollectBoot != nil {
+			for _, p := range a.Table.Players {
+				if err := a.Wallet.CollectBoot(context.Background(), p.ID, a.Table.BootAmount, a.Table.ID); err != nil {
+					reply.Err = fmt.Errorf("collect boot: %w", err)
+					break
+				}
+			}
+			if reply.Err != nil {
+				break
+			}
+		}
 		err := a.Table.StartRound()
 		if err != nil {
 			reply.Err = err
@@ -111,6 +139,7 @@ func (a *TableActor) handleEvent(evt TableEvent) {
 			if err != nil {
 				reply.Err = err
 			} else {
+				a.creditWinners(winners)
 				reply.Broadcast = a.buildResultBroadcast(winners)
 			}
 		} else {
@@ -141,6 +170,7 @@ func (a *TableActor) handleEvent(evt TableEvent) {
 			if err != nil {
 				log.Printf("showdown error: %v", err)
 			} else {
+				a.creditWinners(winners)
 				reply.Broadcast = a.buildResultBroadcast(winners)
 			}
 		} else {
@@ -194,6 +224,20 @@ func (a *TableActor) Send(evt TableEvent) TableReply {
 	evt.Reply = make(chan TableReply, 1)
 	a.Events <- evt
 	return <-evt.Reply
+}
+
+// creditWinners credits pot winnings to winners via wallet if configured.
+func (a *TableActor) creditWinners(winners []string) {
+	if a.Wallet == nil || a.Wallet.CreditWinnings == nil || a.Table.GameState == nil {
+		return
+	}
+	pot := a.Table.GameState.Pot
+	share := pot / int64(len(winners))
+	for _, wid := range winners {
+		if err := a.Wallet.CreditWinnings(context.Background(), wid, share, a.Table.ID); err != nil {
+			log.Printf("credit winnings error for %s: %v", wid, err)
+		}
+	}
 }
 
 // --- broadcast builders ---
@@ -316,4 +360,56 @@ func (a *TableActor) buildResultBroadcast(winners []string) []BroadcastMsg {
 			"balances": balances,
 		},
 	}}
+}
+
+func (a *TableActor) buildReconnectBroadcast(playerID string) []BroadcastMsg {
+	msgs := []BroadcastMsg{}
+
+	// Send current table state
+	players := make([]map[string]any, len(a.Table.Players))
+	for i, p := range a.Table.Players {
+		players[i] = map[string]any{
+			"id":         p.ID,
+			"name":       p.Name,
+			"balance":    p.Balance,
+			"is_seen":    p.IsSeen,
+			"has_folded": p.HasFolded,
+		}
+	}
+
+	payload := map[string]any{
+		"table_id": a.Table.ID,
+		"state":    a.Table.State.String(),
+		"players":  players,
+	}
+
+	gs := a.Table.GameState
+	if gs != nil {
+		payload["pot"] = gs.Pot
+		payload["current_bet"] = gs.CurrentBet
+		payload["boot_amount"] = gs.BootAmount
+		if len(gs.ActivePlayers) > 0 && gs.CurrentTurn < len(gs.ActivePlayers) {
+			payload["current_turn"] = gs.ActivePlayers[gs.CurrentTurn]
+		}
+
+		// Send the player's own hand privately
+		if hand, ok := gs.Hands[playerID]; ok {
+			cardDTOs := make([]map[string]string, len(hand))
+			for i, c := range hand {
+				cardDTOs[i] = map[string]string{
+					"rank": c.Rank.String(),
+					"suit": c.Suit.String(),
+				}
+			}
+			payload["your_hand"] = cardDTOs
+		}
+	}
+
+	msgs = append(msgs, BroadcastMsg{
+		TargetID: playerID,
+		Type:     "TABLE_STATE",
+		Payload:  payload,
+	})
+
+	return msgs
 }

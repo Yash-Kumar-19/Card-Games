@@ -8,13 +8,15 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // User represents a registered user.
 type User struct {
 	ID       string `json:"id"`
 	Username string `json:"username"`
-	Password string `json:"-"` // stored as-is for now; hash in production
+	Password string `json:"-"` // bcrypt hash
+	Balance  int64  `json:"balance"`
 }
 
 // Store is an in-memory user store (replaced with DB in Phase 3).
@@ -42,10 +44,15 @@ func (s *Store) Register(username, password string) (*User, error) {
 	if _, exists := s.users[username]; exists {
 		return nil, fmt.Errorf("username %q already taken", username)
 	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, fmt.Errorf("hash password: %w", err)
+	}
 	u := &User{
 		ID:       uuid.New().String(),
 		Username: username,
-		Password: password,
+		Password: string(hash),
+		Balance:  10000, // starting balance
 	}
 	s.users[username] = u
 	s.byID[u.ID] = u
@@ -57,7 +64,10 @@ func (s *Store) Authenticate(username, password string) (*User, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	u, ok := s.users[username]
-	if !ok || u.Password != password {
+	if !ok {
+		return nil, errors.New("invalid credentials")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(u.Password), []byte(password)); err != nil {
 		return nil, errors.New("invalid credentials")
 	}
 	return u, nil
