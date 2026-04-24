@@ -86,7 +86,38 @@ func (a *TableActor) handleEvent(evt TableEvent) {
 		if err != nil {
 			reply.Err = err
 		} else {
-			reply.Broadcast = a.buildTableStateBroadcast("PLAYER_JOINED")
+			// Private TABLE_STATE to the joining player so their client sets tableId and navigates
+			players := make([]map[string]any, len(a.Table.Players))
+			for i, p := range a.Table.Players {
+				players[i] = map[string]any{"id": p.ID, "name": p.Name, "balance": p.Balance}
+			}
+			joinAck := BroadcastMsg{
+				TargetID: evt.PlayerID,
+				Type:     "TABLE_STATE",
+				Payload: map[string]any{
+					"table_id":     a.Table.ID,
+					"state":        a.Table.State.String(),
+					"players":      players,
+					"pot":          int64(0),
+					"current_bet":  int64(0),
+					"boot_amount":  a.Table.BootAmount,
+					"current_turn": "",
+				},
+			}
+			// Broadcast PLAYER_JOINED with correct PlayerStateDTO shape to all at the table
+			joinedMsg := BroadcastMsg{
+				Type: "PLAYER_JOINED",
+				Payload: map[string]any{
+					"id":         player.ID,
+					"name":       player.Name,
+					"balance":    player.Balance,
+					"is_seen":    false,
+					"has_folded": false,
+					"is_active":  true,
+					"card_count": 0,
+				},
+			}
+			reply.Broadcast = []BroadcastMsg{joinAck, joinedMsg}
 		}
 
 	case "leave":
@@ -94,7 +125,10 @@ func (a *TableActor) handleEvent(evt TableEvent) {
 		if err != nil {
 			reply.Err = err
 		} else {
-			reply.Broadcast = a.buildTableStateBroadcast("PLAYER_LEFT")
+			reply.Broadcast = []BroadcastMsg{{
+				Type:    "PLAYER_LEFT",
+				Payload: map[string]any{"player_id": evt.PlayerID},
+			}}
 		}
 
 	case "reconnect":
@@ -265,6 +299,20 @@ func (a *TableActor) buildDealBroadcast() []BroadcastMsg {
 	msgs := []BroadcastMsg{}
 	gs := a.Table.GameState
 
+	// Build public player state for all players (no hand revealed)
+	playerDTOs := make([]map[string]any, len(a.Table.Players))
+	for i, p := range a.Table.Players {
+		playerDTOs[i] = map[string]any{
+			"id":         p.ID,
+			"name":       p.Name,
+			"balance":    p.Balance,
+			"is_seen":    p.IsSeen,
+			"has_folded": p.HasFolded,
+			"is_active":  p.IsActive,
+			"card_count": len(gs.Hands[p.ID]),
+		}
+	}
+
 	// Send each player their own cards privately
 	for _, p := range a.Table.Players {
 		cards := gs.Hands[p.ID]
@@ -282,6 +330,7 @@ func (a *TableActor) buildDealBroadcast() []BroadcastMsg {
 				"cards":       cardDTOs,
 				"pot":         gs.Pot,
 				"current_bet": gs.CurrentBet,
+				"players":     playerDTOs,
 			},
 		})
 	}
@@ -307,6 +356,20 @@ func (a *TableActor) buildTurnBroadcast() []BroadcastMsg {
 		return nil
 	}
 	currentID := gs.ActivePlayers[gs.CurrentTurn]
+
+	playerDTOs := make([]map[string]any, len(a.Table.Players))
+	for i, p := range a.Table.Players {
+		playerDTOs[i] = map[string]any{
+			"id":         p.ID,
+			"name":       p.Name,
+			"balance":    p.Balance,
+			"is_seen":    p.IsSeen,
+			"has_folded": p.HasFolded,
+			"is_active":  p.IsActive,
+			"card_count": len(gs.Hands[p.ID]),
+		}
+	}
+
 	return []BroadcastMsg{{
 		Type: "TURN_CHANGE",
 		Payload: map[string]any{
@@ -314,6 +377,7 @@ func (a *TableActor) buildTurnBroadcast() []BroadcastMsg {
 			"current_bet": gs.CurrentBet,
 			"pot":         gs.Pot,
 			"timeout_sec": int(a.TurnTimeout.Seconds()),
+			"players":     playerDTOs,
 		},
 	}}
 }

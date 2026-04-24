@@ -65,6 +65,9 @@ func main() {
 	// Wire reconnection handler
 	hub.OnReconnect = srv.handleReconnect
 
+	// Wire disconnect handler — removes player from table on WebSocket close
+	hub.OnDisconnect = srv.handleDisconnect
+
 	// --- HTTP Routes ---
 	mux := http.NewServeMux()
 
@@ -192,6 +195,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid token", http.StatusUnauthorized)
 		return
 	}
+	// Ensure user exists in MemStore (handles server restarts where in-memory data is lost but JWTs remain valid).
+	s.store.EnsureUser(r.Context(), claims.UserID, claims.Username, 10000)
 	s.hub.HandleWebSocket(claims.UserID, claims.Username, w, r)
 }
 
@@ -230,6 +235,15 @@ func (s *Server) handleJoinTable(clientID, tableID string) {
 		PlayerID: clientID,
 	})
 	if reply.Err != nil {
+		// If the player is already seated, treat it as a reconnect and restore state
+		if strings.Contains(reply.Err.Error(), "already at table") {
+			s.hub.SetClientTable(clientID, tableID)
+			reconnect := actor.Send(engine.TableEvent{Type: "reconnect", PlayerID: clientID})
+			if reconnect.Err == nil && len(reconnect.Broadcast) > 0 {
+				s.broadcastToTable(tableID, reconnect.Broadcast)
+			}
+			return
+		}
 		s.hub.SendToClient(clientID, ws.ServerMessage{
 			Type:  ws.EventError,
 			Error: reply.Err.Error(),
@@ -261,6 +275,18 @@ func (s *Server) handleLeaveTable(clientID, tableID string) {
 
 	s.playerMap.Delete(clientID)
 	s.hub.SetClientTable(clientID, "")
+
+	if len(actor.Table.Players) == 0 {
+		log.Printf("table %s empty, removing", tableID)
+		s.lobby.RemoveTable(tableID)
+	}
+}
+
+func (s *Server) handleDisconnect(clientID string) {
+	tableID := s.playerMap.Get(clientID)
+	if tableID != "" {
+		s.handleLeaveTable(clientID, tableID)
+	}
 }
 
 func (s *Server) handleStartGame(clientID, tableID string) {

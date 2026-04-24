@@ -54,6 +54,35 @@ func (m *MemStore) CreateUser(_ context.Context, username, passwordHash string, 
 	return u, nil
 }
 
+// EnsureUser guarantees the given ID exists in the wallet store with at least the
+// specified balance. Safe to call on every WebSocket connection — it is a no-op if
+// the user is already present by ID. If the username is already taken by a different
+// ID (e.g. after a server restart where the user re-registered), the entry is still
+// created under the requested ID using the ID itself as a placeholder username.
+func (m *MemStore) EnsureUser(_ context.Context, id, username string, balance int64) *UserRow {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if u, ok := m.users[id]; ok {
+		return u
+	}
+	// Avoid username collision: if the name is taken, use the UUID as the stored name.
+	uname := username
+	if _, taken := m.byName[username]; taken {
+		uname = id
+	}
+	now := time.Now()
+	u := &UserRow{
+		ID:        id,
+		Username:  uname,
+		Balance:   balance,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	m.users[id] = u
+	m.byName[uname] = u
+	return u
+}
+
 // CreateUserWithID creates a user with a specific ID (for syncing with auth store).
 func (m *MemStore) CreateUserWithID(_ context.Context, id, username, passwordHash string, balance int64) (*UserRow, error) {
 	m.mu.Lock()

@@ -31,10 +31,11 @@ type Client struct {
 
 // Hub manages all connected WebSocket clients.
 type Hub struct {
-	clients     map[string]*Client // playerID -> Client
-	mu          sync.RWMutex
-	OnMessage   func(clientID string, msg ClientMessage)
-	OnReconnect func(clientID string) // called when a known player reconnects
+	clients      map[string]*Client // playerID -> Client
+	mu           sync.RWMutex
+	OnMessage    func(clientID string, msg ClientMessage)
+	OnReconnect  func(clientID string) // called when a known player reconnects
+	OnDisconnect func(clientID string) // called when a client's WebSocket closes
 }
 
 // NewHub creates a new WebSocket hub.
@@ -54,10 +55,13 @@ func (h *Hub) Register(c *Client) {
 // Unregister removes a client from the hub.
 func (h *Hub) Unregister(clientID string) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if c, ok := h.clients[clientID]; ok {
 		close(c.send)
 		delete(h.clients, clientID)
+	}
+	h.mu.Unlock()
+	if h.OnDisconnect != nil {
+		h.OnDisconnect(clientID)
 	}
 }
 
